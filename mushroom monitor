@@ -1,0 +1,595 @@
+import paho.mqtt.client as mqtt
+from pymodbus.client import ModbusTcpClient
+from pymodbus.exceptions import ModbusException
+import json
+import sqlite3
+import threading
+import time
+import logging
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from datetime import datetime, timedelta
+from collections import defaultdict
+import numpy as np
+import os
+
+# ================== CONFIGURATION ==================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - [%(levelname)s] - %(message)s',
+    handlers=[
+        logging.FileHandler('logs/mushroom_robot_monitor.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+MODBUS_HOST = "192.168.2.88"
+MODBUS_PORT = 502
+MQTT_BROKER = "192.168.1.107"
+MQTT_PORT = 1885
+MQTT_TOPIC_READ = "AgaricusBisporusHarvesting/TR2001"
+MQTT_TOPIC_WRITE = ["AgaricusBisporusHarvesting/PR0001", "AgaricusBisporusHarvesting/EL0001"]
+
+# ================== DATABASE SETUP ==================
+class MonitoringDatabase:
+    def __init__(self, db_file="logs/monitoring_data.db"):
+        self.db_file = db_file
+        os.makedirs(os.path.dirname(db_file), exist_ok=True)
+        self.init_database()
+    
+    def init_database(self):
+        """Initialize SQLite database"""
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS modbus_registers (
+                id INTEGER PRIMARY KEY,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                device_id INTEGER,
+                register_name TEXT,
+                value REAL,
+                data_type TEXT
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS mqtt_messages (
+                id INTEGER PRIMARY KEY,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                topic TEXT,
+                payload TEXT,
+                source TEXT
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS state_transitions (
+                id INTEGER PRIMARY KEY,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                previous_state TEXT,
+                new_state TEXT,
+                register_name TEXT,
+                value INTEGER
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS alerts (
+                id INTEGER PRIMARY KEY,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                alert_type TEXT,
+                severity TEXT,
+                message TEXT,
+                register_name TEXT,
+                value REAL
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+        logger.info("✓ Database initialized")
+    
+    def store_register(self, device_id, register_name, value, data_type):
+        """Store Modbus register value"""
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO modbus_registers (device_id, register_name, value, data_type)
+            VALUES (?, ?, ?, ?)
+        ''', (device_id, register_name, value, data_type))
+        conn.commit()
+        conn.close()
+    
+    def store_mqtt_message(self, topic, payload, source):
+        """Store MQTT message"""
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO mqtt_messages (topic, payload, source)
+            VALUES (?, ?, ?)
+        ''', (topic, payload, source))
+        conn.commit()
+        conn.close()
+    
+    def record_state_transition(self, prev_state, new_state, register_name, value):
+        """Record state machine transition"""
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO state_transitions (previous_state, new_state, register_name, value)
+            VALUES (?, ?, ?, ?)
+        ''', (prev_state, new_state, register_name, value))
+        conn.commit()
+        conn.close()
+    
+    def log_alert(self, alert_type, severity, message, register_name=None, value=None):
+        """Log an alert"""
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO alerts (alert_type, severity, message, register_name, value)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (alert_type, severity, message, register_name, value))
+        conn.commit()
+        conn.close()
+        logger.warning(f"🚨 ALERT [{severity}] {alert_type}: {message}")
+
+# ================== ROBOT STATE ANALYZER ==================
+class RobotStateAnalyzer:
+    """Analyze and track robot state transitions and behavior"""
+    
+    def __init__(self, db):
+        self.db = db
+        self.previous_state = {}
+        self.state_enum_map = {
+            "RunningMode": {1: "Stop", 2: "Running", 3: "Debugging"},
+            "MovingStatus": {1: "Forward", 2: "Backward", 3: "Standby"},
+            "MovingTarget": {1: "PickingRobot", 2: "Lift"},
+            "BehaviorStatus": {1: "Approaching", 2: "Docking", 3: "Docked"},
+            "BasketStatus": {0: "Waiting", 1: "Extended", 2: "ExtendedFull", 3: "Retracted"}
+        }
+    
+    def analyze_register_change(self, register_name, value):
+        """Analyze when a register changes value"""
+        prev = self.previous_state.get(register_name)
+        
+        if prev is None:
+            self.previous_state[register_name] = value
+            return None
+        
+        if prev != value:
+            prev_state = self._translate_state(register_name, prev)
+            new_state = self._translate_state(register_name, value)
+            
+            logger.info(f"📊 State Change: {register_name} → {prev_state} → {new_state}")
+            
+            self.db.record_state_transition(prev_state, new_state, register_name, value)
+            self.previous_state[register_name] = value
+            
+            self._detect_anomalies(register_name, value)
+            
+            return {"register": register_name, "from": prev_state, "to": new_state}
+        
+        return None
+    
+    def _translate_state(self, register_name, value):
+        """Convert numeric state to readable name"""
+        mapping = self.state_enum_map.get(register_name)
+        if mapping:
+            return mapping.get(int(value), f"Unknown({value})")
+        return str(value)
+    
+    def _detect_anomalies(self, register_name, value):
+        """Detect anomalous state transitions"""
+        
+        if register_name == "ESTOP" and value == 1:
+            self.db.log_alert("ESTOP_TRIGGERED", "CRITICAL", "Emergency stop activated!", register_name, value)
+        
+        if register_name == "Error" and value == 1:
+            self.db.log_alert("ERROR_STATE", "HIGH", "Device error detected", register_name, value)
+        
+        if register_name == "MovingStatus":
+            if value not in [1, 2, 3]:
+                self.db.log_alert("INVALID_MOVEMENT_STATUS", "HIGH", f"Invalid movement status: {value}", register_name, value)
+        
+        if register_name == "BehaviorStatus" and value == 3:
+            logger.info("✓ Docking completed successfully")
+        
+        if register_name == "BasketStatus":
+            if value not in [0, 1, 2, 3]:
+                self.db.log_alert("INVALID_BASKET_STATUS", "MEDIUM", f"Invalid basket status: {value}", register_name, value)
+
+# ================== MODBUS MONITOR ==================
+class ModbusMonitor:
+    def __init__(self, host, port, db):
+        self.host = host
+        self.port = port
+        self.db = db
+        self.client = None
+        self.connected = False
+        self.register_history = defaultdict(list)
+        self.state_analyzer = RobotStateAnalyzer(db)
+    
+    def connect(self):
+        """Connect to Modbus TCP server"""
+        try:
+            self.client = ModbusTcpClient(self.host, port=self.port)
+            if self.client.connect():
+                self.connected = True
+                logger.info(f"✓ Connected to Modbus TCP: {self.host}:{self.port}")
+                return True
+            else:
+                logger.error("✗ Modbus connection failed")
+                return False
+        except Exception as e:
+            logger.error(f"✗ Modbus connection error: {str(e)}")
+            return False
+    
+    def read_registers(self, register_config):
+        """Read all configured registers"""
+        if not self.connected or not self.client:
+            return {}
+        
+        data = {}
+        for reg in register_config:
+            try:
+                result = self.client.read_holding_registers(
+                    address=reg["address"],
+                    count=reg["count"],
+                    slave=2
+                )
+                
+                if not result.isError():
+                    if reg["data_type"] == "int16":
+                        value = result.registers[0]
+                        if value >= 32768:
+                            value = value - 65536
+                    elif reg["data_type"] == "int32":
+                        value = (result.registers[0] << 16) | result.registers[1]
+                        if value >= 2147483648:
+                            value = value - 4294967296
+                    else:
+                        value = result.registers[0]
+                    
+                    value *= reg.get("scale", 1)
+                    data[reg["name"]] = value
+                    
+                    self.db.store_register(2001, reg["name"], value, reg["data_type"])
+                    
+                    state_change = self.state_analyzer.analyze_register_change(reg["name"], value)
+                    
+                    self.register_history[reg["name"]].append({
+                        "timestamp": datetime.now(),
+                        "value": value
+                    })
+                    
+                else:
+                    logger.error(f"✗ Failed to read {reg['name']}")
+                    
+            except Exception as e:
+                logger.error(f"✗ Error reading {reg['name']}: {str(e)}")
+        
+        return data
+    
+    def disconnect(self):
+        """Disconnect from Modbus"""
+        if self.client:
+            self.client.close()
+            self.connected = False
+            logger.info("Modbus disconnected")
+
+# ================== MQTT MONITOR ==================
+class MQTTMonitor:
+    def __init__(self, broker, port, db):
+        self.broker = broker
+        self.port = port
+        self.db = db
+        self.client = mqtt.Client(client_id="mushroom_monitor")
+        self.message_count = 0
+        self.error_count = 0
+        self.setup_callbacks()
+    
+    def setup_callbacks(self):
+        self.client.on_connect = self.on_connect
+        self.client.on_message = self.on_message
+        self.client.on_disconnect = self.on_disconnect
+    
+    def on_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            logger.info(f"✓ Connected to MQTT broker: {self.broker}:{self.port}")
+            client.subscribe(MQTT_TOPIC_READ, qos=1)
+            client.subscribe(MQTT_TOPIC_WRITE[0], qos=1)
+            client.subscribe(MQTT_TOPIC_WRITE[1], qos=1)
+        else:
+            logger.error(f"✗ MQTT connection failed: {rc}")
+    
+    def on_message(self, client, userdata, msg):
+        try:
+            self.message_count += 1
+            payload = msg.payload.decode('utf-8', errors='ignore')
+            
+            logger.info(f"📨 MQTT [{msg.topic}]: {payload[:100]}")
+            
+            self.db.store_mqtt_message(msg.topic, payload, "MQTT")
+            
+            try:
+                data = json.loads(payload)
+                self._analyze_mqtt_payload(msg.topic, data)
+            except json.JSONDecodeError:
+                pass
+                
+        except Exception as e:
+            logger.error(f"✗ Error processing MQTT message: {str(e)}")
+            self.error_count += 1
+    
+    def _analyze_mqtt_payload(self, topic, data):
+        """Analyze MQTT payload for important signals"""
+        
+        if "CurrentPosition" in data and data["CurrentPosition"] < 100:
+            logger.warning(f"⚠️  Close to elevator: {data['CurrentPosition']}mm")
+        
+        if "DistanceToPickingRobot" in data and data["DistanceToPickingRobot"] < 100:
+            logger.warning(f"⚠️  Close to picking robot: {data['DistanceToPickingRobot']}mm")
+        
+        if data.get("Error") == 1:
+            error_code = data.get("ErrorCode", "Unknown")
+            self.db.log_alert("MQTT_ERROR", "HIGH", f"Error from MQTT: Code {error_code}", "MQTT", error_code)
+    
+    def on_disconnect(self, client, userdata, rc):
+        if rc != 0:
+            logger.warning(f"⚠️  Unexpected MQTT disconnection: {rc}")
+            self.error_count += 1
+    
+    def connect(self):
+        """Connect to MQTT broker"""
+        try:
+            self.client.connect(self.broker, self.port, keepalive=60)
+            self.client.loop_start()
+            return True
+        except Exception as e:
+            logger.error(f"✗ MQTT connection error: {str(e)}")
+            return False
+    
+    def disconnect(self):
+        """Disconnect from MQTT"""
+        self.client.loop_stop()
+        self.client.disconnect()
+
+# ================== WAVEFORM GENERATOR ==================
+class WaveformGenerator:
+    def __init__(self, db):
+        self.db = db
+    
+    def generate_register_waveforms(self, modbus_monitor):
+        """Generate waveform diagrams for key registers"""
+        os.makedirs("logs/waveforms", exist_ok=True)
+        
+        key_registers = [
+            "CurrentPosition",
+            "DistanceToPickingRobot",
+            "RunningMode",
+            "MovingStatus",
+            "BehaviorStatus",
+            "CollectedMushroomCount"
+        ]
+        
+        for reg_name in key_registers:
+            if reg_name in modbus_monitor.register_history:
+                self._plot_register(reg_name, modbus_monitor.register_history[reg_name])
+    
+    def _plot_register(self, register_name, history):
+        """Plot a single register's history"""
+        if len(history) < 2:
+            return
+        
+        timestamps = [h["timestamp"] for h in history]
+        values = [h["value"] for h in history]
+        
+        fig, ax = plt.subplots(figsize=(14, 5), dpi=100)
+        
+        ax.plot(timestamps, values, marker='o', linestyle='-', linewidth=2, markersize=4, color='#2E86AB', label=register_name)
+        ax.fill_between(timestamps, values, alpha=0.3, color='#2E86AB')
+        
+        ax.set_xlabel('Time', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Value', fontsize=12, fontweight='bold')
+        ax.set_title(f'Register Waveform: {register_name}', fontsize=14, fontweight='bold')
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+        plt.xticks(rotation=45, ha='right')
+        ax.grid(True, alpha=0.3, linestyle='--')
+        ax.legend()
+        
+        plt.tight_layout()
+        plt.savefig(f"logs/waveforms/{register_name}_waveform.png", dpi=100, bbox_inches='tight')
+        plt.close()
+        
+        logger.info(f"✓ Generated waveform: logs/waveforms/{register_name}_waveform.png")
+    
+    def generate_html_report(self, modbus_monitor, mqtt_monitor):
+        """Generate comprehensive HTML report"""
+        os.makedirs("logs/reports", exist_ok=True)
+        
+        report_file = f"logs/reports/report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+        
+        conn = sqlite3.connect(self.db.db_file)
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT COUNT(*) FROM modbus_registers")
+        modbus_count = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM mqtt_messages")
+        mqtt_count = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM alerts WHERE severity='CRITICAL'")
+        critical_alerts = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT timestamp, alert_type, severity, message FROM alerts ORDER BY timestamp DESC LIMIT 10")
+        recent_alerts = cursor.fetchall()
+        
+        conn.close()
+        
+        html = f'''<!DOCTYPE html>
+<html>
+<head>
+    <title>Mushroom Robot Monitor Report</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }}
+        .container {{ max-width: 1200px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+        h1 {{ color: #2E86AB; border-bottom: 3px solid #2E86AB; padding-bottom: 10px; }}
+        h2 {{ color: #A23B72; margin-top: 30px; }}
+        .metric-box {{ display: inline-block; margin: 10px 20px; padding: 15px; background: #f0f0f0; border-radius: 4px; border-left: 4px solid #2E86AB; }}
+        .metric-value {{ font-size: 28px; font-weight: bold; color: #2E86AB; }}
+        .metric-label {{ color: #666; font-size: 12px; }}
+        table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
+        th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }}
+        th {{ background-color: #2E86AB; color: white; }}
+        .alert-critical {{ background-color: #ffcccc; }}
+        .alert-high {{ background-color: #ffe0cc; }}
+        .alert-medium {{ background-color: #ffffcc; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🤖 Mushroom Harvesting Robot Monitor Report</h1>
+        <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+        
+        <h2>Communication Statistics</h2>
+        <div class="metric-box">
+            <div class="metric-value">{modbus_count}</div>
+            <div class="metric-label">Modbus Registers Read</div>
+        </div>
+        <div class="metric-box">
+            <div class="metric-value">{mqtt_count}</div>
+            <div class="metric-label">MQTT Messages</div>
+        </div>
+        <div class="metric-box">
+            <div class="metric-value">{critical_alerts}</div>
+            <div class="metric-label">Critical Alerts</div>
+        </div>
+        
+        <h2>Recent Alerts</h2>
+        <table>
+            <tr>
+                <th>Time</th>
+                <th>Type</th>
+                <th>Severity</th>
+                <th>Message</th>
+            </tr>
+'''
+        
+        for alert in recent_alerts:
+            severity_class = f"alert-{alert[2].lower()}"
+            html += f'''
+            <tr class="{severity_class}">
+                <td>{alert[0]}</td>
+                <td>{alert[1]}</td>
+                <td>{alert[2]}</td>
+                <td>{alert[3]}</td>
+            </tr>
+'''
+        
+        html += '''
+        </table>
+        <hr>
+        <p style="text-align: center; color: #999; font-size: 12px;">
+            Mushroom Robot Monitor | Report Generated Automatically
+        </p>
+    </div>
+</body>
+</html>
+'''
+        
+        with open(report_file, 'w') as f:
+            f.write(html)
+        
+        logger.info(f"✓ Generated report: {report_file}")
+
+# ================== REGISTER CONFIGURATION ==================
+REGISTER_CONFIG = [
+    {"name": "DeviceID", "address": 2000, "count": 1, "data_type": "int16", "scale": 1.0},
+    {"name": "DeviceType", "address": 2001, "count": 1, "data_type": "int16", "scale": 1.0},
+    {"name": "MatchedDeviceID", "address": 2002, "count": 1, "data_type": "int16", "scale": 1.0},
+    {"name": "RunningMode", "address": 2003, "count": 1, "data_type": "int16", "scale": 1.0},
+    {"name": "MovingStatus", "address": 2004, "count": 1, "data_type": "int16", "scale": 1.0},
+    {"name": "MovingTarget", "address": 2005, "count": 1, "data_type": "int16", "scale": 1.0},
+    {"name": "BehaviorStatus", "address": 2006, "count": 1, "data_type": "int16", "scale": 1.0},
+    {"name": "CurrentPosition", "address": 2007, "count": 2, "data_type": "int32", "scale": 1.0},
+    {"name": "DistanceToPickingRobot", "address": 2009, "count": 2, "data_type": "int32", "scale": 1.0},
+    {"name": "PickingRobotDeteced", "address": 2011, "count": 1, "data_type": "int16", "scale": 1.0},
+    {"name": "CuttingReady", "address": 2012, "count": 1, "data_type": "int16", "scale": 1.0},
+    {"name": "CollectedMushroomCount", "address": 2013, "count": 1, "data_type": "int16", "scale": 1.0},
+    {"name": "ESTOP", "address": 2014, "count": 1, "data_type": "int16", "scale": 1.0},
+    {"name": "Error", "address": 2015, "count": 1, "data_type": "int16", "scale": 1.0},
+    {"name": "ErrorCode", "address": 2016, "count": 1, "data_type": "int16", "scale": 1.0},
+    {"name": "HorizontalMaxCount", "address": 2017, "count": 1, "data_type": "int16", "scale": 1.0},
+    {"name": "BasketStatus", "address": 2018, "count": 1, "data_type": "int16", "scale": 1.0},
+    {"name": "RoomID", "address": 2019, "count": 1, "data_type": "int16", "scale": 1.0},
+    {"name": "ShelfID", "address": 2020, "count": 1, "data_type": "int16", "scale": 1.0},
+    {"name": "CurrentFloor", "address": 2021, "count": 1, "data_type": "int16", "scale": 1.0},
+    {"name": "TaskType", "address": 2022, "count": 1, "data_type": "int16", "scale": 1.0},
+]
+
+# ================== MAIN MONITORING SYSTEM ==================
+class MushroomRobotMonitor:
+    def __init__(self):
+        self.db = MonitoringDatabase()
+        self.modbus_monitor = ModbusMonitor(MODBUS_HOST, MODBUS_PORT, self.db)
+        self.mqtt_monitor = MQTTMonitor(MQTT_BROKER, MQTT_PORT, self.db)
+        self.waveform_generator = WaveformGenerator(self.db)
+        self.register_config = REGISTER_CONFIG
+    
+    def start(self, duration=None):
+        """Start monitoring"""
+        logger.info("="*60)
+        logger.info("🚀 Mushroom Robot Monitoring System Started")
+        logger.info("="*60)
+        
+        if not self.modbus_monitor.connect():
+            logger.error("Failed to connect to Modbus")
+            return
+        
+        if not self.mqtt_monitor.connect():
+            logger.error("Failed to connect to MQTT")
+            return
+        
+        start_time = time.time()
+        
+        try:
+            while True:
+                modbus_data = self.modbus_monitor.read_registers(self.register_config)
+                
+                if modbus_data:
+                    logger.debug(f"📊 Modbus data: {json.dumps(modbus_data, indent=2)}")
+                
+                if duration and (time.time() - start_time) > duration:
+                    break
+                
+                time.sleep(0.5)
+                
+        except KeyboardInterrupt:
+            logger.info("\n⏹️  Monitoring stopped by user")
+        finally:
+            self.stop()
+    
+    def stop(self):
+        """Stop monitoring and generate reports"""
+        logger.info("Shutting down...")
+        
+        logger.info("Generating waveform diagrams...")
+        self.waveform_generator.generate_register_waveforms(self.modbus_monitor)
+        
+        logger.info("Generating HTML report...")
+        self.waveform_generator.generate_html_report(self.modbus_monitor, self.mqtt_monitor)
+        
+        self.modbus_monitor.disconnect()
+        self.mqtt_monitor.disconnect()
+        
+        logger.info("="*60)
+        logger.info("✓ Monitoring system stopped")
+        logger.info("="*60)
+
+if __name__ == "__main__":
+    monitor = MushroomRobotMonitor()
+    monitor.start(duration=300)
