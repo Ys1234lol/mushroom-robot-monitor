@@ -1,0 +1,33 @@
+# Quick Start Guide
+
+Get up and running in 5 minutes!
+
+## Step 1: Clone Repository (1 min)
+
+```bash
+git clone https://github.com/Ys1234lol/mushroom-robot-monitor.git
+cd mushroom-robot-monitor
+Step 2: Install Dependencies (2 min)
+第 2 步：安装依赖项（2 分钟）
+pip install -r requirements.txt
+第 3 步：配置网络（1 分钟）
+MODBUS_HOST = "YOUR_PLC_IP"        # e.g., 192.168.2.88
+MODBUS_PORT = 502
+MQTT_BROKER = "YOUR_MQTT_BROKER"   # e.g., 192.168.1.107
+MQTT_PORT = 1885
+python mushroom_robot_monitor.py
+第 4 步：运行 1 分钟
+✓ Connected to Modbus TCP
+✓ Connected to MQTT broker
+🚀 Mushroom Robot Monitoring System Started
+第 5 步：检查输出结果
+After running for 5 minutes, Ctrl+C to stop:
+运行 5 分钟后，按 Ctrl+C 键停止：
+
+bash
+# View log
+cat logs/mushroom_robot_monitor.log
+# View waveforms
+ls -la logs/waveforms/
+# Open HTML report
+open logs/reports/report_*.html
